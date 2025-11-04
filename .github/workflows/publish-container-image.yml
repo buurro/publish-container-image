@@ -1,0 +1,237 @@
+name: Publish Container Image
+
+on:
+  workflow_call:
+    inputs:
+      registry:
+        description: 'Container registry to push to'
+        required: false
+        type: string
+        default: 'ghcr.io'
+      image-name:
+        description: 'Image name (defaults to repository name)'
+        required: false
+        type: string
+      nix-flake-attr:
+        description: 'Nix flake attribute for the container image'
+        required: false
+        type: string
+        default: '.#containerImage'
+      tag-latest:
+        description: 'Whether to tag the image as latest'
+        required: false
+        type: boolean
+        default: true
+      ubuntu-version:
+        description: 'Ubuntu version for the runner'
+        required: false
+        type: string
+        default: '24.04'
+      architectures:
+        description: 'Architectures to build (space or comma-separated, e.g., "amd64 arm64" or "amd64,arm64")'
+        required: false
+        type: string
+        default: 'amd64 arm64'
+    outputs:
+      image-tag:
+        description: 'The version tag of the published image'
+        value: ${{ jobs.build-and-push-image.outputs.image-tag }}
+      full-image-name:
+        description: 'The full image name (registry/image:tag)'
+        value: ${{ jobs.create-manifest.outputs.full-image-name }}
+
+env:
+  REGISTRY: ${{ inputs.registry }}
+
+jobs:
+  prepare-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.prepare.outputs.matrix }}
+      architectures: ${{ steps.prepare.outputs.architectures }}
+      image-name: ${{ steps.prepare.outputs.image-name }}
+    steps:
+      - name: Checkout action repository (for scripts)
+        uses: actions/checkout@v5
+        with:
+          repository: buurro/publish-container-image
+          path: .action-repo
+
+      - name: Checkout user repository
+        uses: actions/checkout@v5
+        with:
+          path: .user-repo
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v20
+
+      - name: Validate inputs
+        run: |
+          bash "$GITHUB_WORKSPACE/.action-repo/.github/scripts/validate-inputs.sh" \
+            "${{ inputs.nix-flake-attr }}" \
+            "${{ inputs.registry }}" \
+            "${{ inputs.image-name }}" \
+            "${{ inputs.architectures }}" \
+            "${{ inputs.ubuntu-version }}"
+
+      - name: Determine image name
+        id: image-name
+        working-directory: .user-repo
+        run: |
+          IMAGE_NAME=$(bash "$GITHUB_WORKSPACE/.action-repo/.github/scripts/determine-image-name.sh" \
+            "${{ inputs.image-name }}" \
+            "${{ inputs.nix-flake-attr }}" \
+            "${{ inputs.registry }}" \
+            "${{ github.repository }}")
+          echo "value=$IMAGE_NAME" >> $GITHUB_OUTPUT
+
+      - name: Prepare build matrix
+        id: prepare
+        run: |
+          RESULT=$(bash "$GITHUB_WORKSPACE/.action-repo/.github/scripts/prepare-matrix.sh" \
+            "${{ inputs.architectures }}" \
+            "${{ inputs.ubuntu-version }}")
+
+          MATRIX=$(echo "$RESULT" | jq -c '.matrix')
+          ARCHS=$(echo "$RESULT" | jq -c '.architectures')
+
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          echo "architectures=$ARCHS" >> $GITHUB_OUTPUT
+          echo "image-name=${{ steps.image-name.outputs.value }}" >> $GITHUB_OUTPUT
+
+  validate-runners:
+    needs: prepare-matrix
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.prepare-matrix.outputs.matrix) }}
+    steps:
+      - name: Validate runner
+        run: |
+          echo "Runner validation successful for architecture: ${{ matrix.arch }}"
+          echo "Runner type: $(uname -m)"
+          echo "OS: $(uname -s)"
+          # Verify Docker is available
+          docker --version
+
+  build-and-push-image:
+    needs: [prepare-matrix, validate-runners]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix: ${{ fromJSON(needs.prepare-matrix.outputs.matrix) }}
+    outputs:
+      image-tag: ${{ steps.build.outputs.tag }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v20
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build container image
+        run: nix build -L ${{ inputs.nix-flake-attr }}
+
+      - name: Load image into Docker
+        run: |
+          if [ ! -f ./result ]; then
+            echo "Error: Nix build result not found"
+            exit 1
+          fi
+          ./result | docker load
+
+      - name: Get image metadata
+        id: build
+        run: |
+          IMAGE_TAG="$(nix eval --raw ${{ inputs.nix-flake-attr }}.imageTag)"
+          NIX_IMAGE_NAME="$(nix eval --raw ${{ inputs.nix-flake-attr }}.imageName)"
+
+          if [ -z "$IMAGE_TAG" ]; then
+            echo "Error: Failed to extract image tag"
+            exit 1
+          fi
+
+          if [ -z "$NIX_IMAGE_NAME" ]; then
+            echo "Error: Failed to extract image name from Nix"
+            exit 1
+          fi
+
+          echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "nix-image-name=$NIX_IMAGE_NAME" >> $GITHUB_OUTPUT
+
+      - name: Retag and push architecture-specific image
+        run: |
+          IMAGE_TAG="${{ steps.build.outputs.tag }}"
+          NIX_IMAGE_NAME="${{ steps.build.outputs.nix-image-name }}"
+          TARGET_IMAGE_NAME="${{ needs.prepare-matrix.outputs.image-name }}"
+
+          echo "Nix image name: $NIX_IMAGE_NAME"
+          echo "Target: ${{ env.REGISTRY }}/$TARGET_IMAGE_NAME:$IMAGE_TAG"
+
+          # Retag if custom image name differs from Nix name
+          if [ "$NIX_IMAGE_NAME" != "${{ env.REGISTRY }}/$TARGET_IMAGE_NAME" ]; then
+            echo "Re-tagging from Nix name to target name..."
+            docker image tag "$NIX_IMAGE_NAME:$IMAGE_TAG" "${{ env.REGISTRY }}/$TARGET_IMAGE_NAME:$IMAGE_TAG"
+          else
+            echo "Image name matches, no retagging needed"
+          fi
+
+          # Verify the image exists
+          if ! docker image inspect "${{ env.REGISTRY }}/$TARGET_IMAGE_NAME:$IMAGE_TAG" >/dev/null 2>&1; then
+            echo "Error: Expected image not found: ${{ env.REGISTRY }}/$TARGET_IMAGE_NAME:$IMAGE_TAG"
+            echo "Available images:"
+            docker images
+            exit 1
+          fi
+
+          # Tag with architecture suffix and push
+          ARCH_TAG="$IMAGE_TAG-${{ matrix.arch }}"
+          docker image tag "${{ env.REGISTRY }}/$TARGET_IMAGE_NAME:$IMAGE_TAG" "${{ env.REGISTRY }}/$TARGET_IMAGE_NAME:$ARCH_TAG"
+          docker push "${{ env.REGISTRY }}/$TARGET_IMAGE_NAME:$ARCH_TAG"
+
+  create-manifest:
+    needs: [prepare-matrix, build-and-push-image]
+    runs-on: ubuntu-${{ inputs.ubuntu-version }}
+    outputs:
+      full-image-name: ${{ steps.output.outputs.full-image-name }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout action repository (for scripts)
+        uses: actions/checkout@v5
+        with:
+          repository: buurro/publish-container-image
+          path: .action-repo
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push manifest
+        run: |
+          bash "$GITHUB_WORKSPACE/.action-repo/.github/scripts/create-manifest.sh" \
+            "${{ env.REGISTRY }}" \
+            "${{ needs.prepare-matrix.outputs.image-name }}" \
+            "${{ needs.build-and-push-image.outputs.image-tag }}" \
+            '${{ needs.prepare-matrix.outputs.architectures }}' \
+            "${{ inputs.tag-latest }}"
+
+      - name: Set outputs
+        id: output
+        run: |
+          IMAGE_TAG="${{ needs.build-and-push-image.outputs.image-tag }}"
+          IMAGE_NAME="${{ needs.prepare-matrix.outputs.image-name }}"
+          echo "full-image-name=${{ env.REGISTRY }}/$IMAGE_NAME:$IMAGE_TAG" >> $GITHUB_OUTPUT

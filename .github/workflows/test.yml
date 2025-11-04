@@ -1,0 +1,304 @@
+name: Test Action
+
+on:
+  push:
+    branches: [main]
+  # DO NOT add pull_request trigger - this would allow
+  # untrusted code from forks to run and potentially
+  # push to your container registry
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Test Flow:
+# Phase 1 (Parallel): test-pytest, test-workflow-prepare, validate-workflow, test-nix-evaluation
+# Phase 2 (After Phase 1): build-and-test-image
+# Phase 3 (After Phase 2, Parallel): test-amd64-only, test-multi-arch, test-custom-image-name
+# Phase 4 (After Phase 3): verify-amd64, verify-multi-arch, verify-custom-image-name
+#
+# If any Phase 1 test fails, all subsequent phases are cancelled.
+
+jobs:
+  # Run all pytest tests (fast, runs first)
+  test-pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v20
+
+      - name: Run script tests
+        run: nix run .#test-scripts
+
+      - name: Run validation tests
+        run: nix run .#test-validation
+
+  # Test workflow preparation phase locally
+  test-workflow-prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v20
+
+      - name: Test workflow-prepare with defaults
+        run: |
+          RESULT=$(nix run .#workflow-prepare)
+          echo "Result: $RESULT"
+
+          # Verify JSON is valid
+          echo "$RESULT" | jq -e '.image_name' > /dev/null
+          echo "$RESULT" | jq -e '.matrix' > /dev/null
+          echo "$RESULT" | jq -e '.architectures' > /dev/null
+
+          echo "✓ workflow-prepare produces valid JSON"
+
+      - name: Test workflow-prepare with custom settings
+        env:
+          ARCHITECTURES: amd64
+          IMAGE_NAME: custom/test-name
+          UBUNTU_VERSION: "22.04"
+        run: |
+          RESULT=$(nix run .#workflow-prepare)
+
+          # Verify custom settings were applied
+          IMAGE_NAME=$(echo "$RESULT" | jq -r '.image_name')
+          ARCHS=$(echo "$RESULT" | jq -r '.architectures | length')
+
+          if [ "$IMAGE_NAME" != "custom/test-name" ]; then
+            echo "Error: Expected custom image name 'custom/test-name', got '$IMAGE_NAME'"
+            exit 1
+          fi
+
+          if [ "$ARCHS" != "1" ]; then
+            echo "Error: Expected 1 architecture, got $ARCHS"
+            exit 1
+          fi
+
+          echo "✓ Custom settings applied correctly"
+
+  # Build and verify the test image locally (only after all preliminary tests pass)
+  build-and-test-image:
+    needs: [test-pytest, test-workflow-prepare, validate-workflow, test-nix-evaluation]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v20
+
+      - name: Build container image
+        run: nix build -L .#containerImage
+
+      - name: Load image into Docker
+        run: ./result | docker load
+
+      - name: Verify image exists
+        run: |
+          docker images | grep publish-container-image
+
+      - name: Test image runs
+        run: |
+          # Run the container briefly to test it works
+          docker run --rm ghcr.io/buurro/publish-container-image:0.2.0 sh -c "echo 'Image works!'"
+
+      - name: Inspect image labels
+        run: |
+          docker inspect ghcr.io/buurro/publish-container-image:0.2.0 | jq '.[0].Config.Labels'
+
+  # Test amd64-only build and publish
+  test-amd64-only:
+    needs: [build-and-test-image]
+    uses: ./.github/workflows/publish-container-image.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      registry: ghcr.io
+      architectures: amd64
+      tag-latest: false
+      nix-flake-attr: '.#containerImage'
+    secrets: inherit
+
+  # Verify amd64 build outputs
+  verify-amd64:
+    needs: test-amd64-only
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify outputs
+        run: |
+          echo "Image tag: ${{ needs.test-amd64-only.outputs.image-tag }}"
+          echo "Full image name: ${{ needs.test-amd64-only.outputs.full-image-name }}"
+
+          if [ -z "${{ needs.test-amd64-only.outputs.image-tag }}" ]; then
+            echo "Error: image-tag output is empty"
+            exit 1
+          fi
+
+          if [ -z "${{ needs.test-amd64-only.outputs.full-image-name }}" ]; then
+            echo "Error: full-image-name output is empty"
+            exit 1
+          fi
+
+          echo "✓ Outputs verified successfully"
+
+  # Test with multi-architecture build
+  # Tests that the matrix build logic works correctly
+  test-multi-arch:
+    needs: [build-and-test-image]
+    uses: ./.github/workflows/publish-container-image.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      registry: ghcr.io
+      architectures: amd64 arm64
+      tag-latest: false
+      nix-flake-attr: '.#containerImage'
+    secrets: inherit
+
+  # Verify multi-arch build creates proper manifest
+  verify-multi-arch:
+    needs: test-multi-arch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log in to registry
+        uses: docker/login-action@v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify multi-arch manifest
+        run: |
+          IMAGE="${{ needs.test-multi-arch.outputs.full-image-name }}"
+          echo "Inspecting manifest for: $IMAGE"
+
+          # Inspect the manifest
+          docker buildx imagetools inspect "$IMAGE"
+
+          # Verify both architectures are present
+          MANIFEST=$(docker buildx imagetools inspect "$IMAGE" --raw)
+
+          if echo "$MANIFEST" | grep -q "amd64"; then
+            echo "✓ amd64 architecture found in manifest"
+          else
+            echo "Error: amd64 architecture not found in manifest"
+            exit 1
+          fi
+
+          if echo "$MANIFEST" | grep -q "arm64"; then
+            echo "✓ arm64 architecture found in manifest"
+          else
+            echo "Error: arm64 architecture not found in manifest"
+            exit 1
+          fi
+
+          echo "✓ Multi-architecture manifest verified successfully"
+
+  # Test with custom image name
+  test-custom-image-name:
+    needs: [build-and-test-image]
+    uses: ./.github/workflows/publish-container-image.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      registry: ghcr.io
+      image-name: buurro/test-custom-name
+      architectures: amd64
+      tag-latest: false
+      nix-flake-attr: '.#containerImage'
+    secrets: inherit
+
+  # Verify custom image name was used
+  verify-custom-image-name:
+    needs: test-custom-image-name
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify custom image name in output
+        run: |
+          FULL_IMAGE="${{ needs.test-custom-image-name.outputs.full-image-name }}"
+          echo "Full image name: $FULL_IMAGE"
+
+          if [[ "$FULL_IMAGE" != *"test-custom-name"* ]]; then
+            echo "Error: Custom image name 'test-custom-name' not found in output"
+            exit 1
+          fi
+
+          echo "✓ Custom image name verified successfully"
+
+  # Validate workflow files and scripts
+  validate-workflow:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Validate workflow file
+        run: |
+          # Check workflow file is valid YAML
+          python3 -c "import yaml; yaml.safe_load(open('.github/workflows/publish-container-image.yml'))"
+
+      - name: Check script permissions
+        run: |
+          for script in .github/scripts/*.sh; do
+            if [ ! -x "$script" ]; then
+              echo "Error: $script is not executable"
+              exit 1
+            fi
+            echo "✓ $script is executable"
+          done
+
+      - name: Validate scripts have proper shebangs
+        run: |
+          for script in .github/scripts/*.sh; do
+            if ! head -1 "$script" | grep -q '^#!/bin/bash'; then
+              echo "Error: $script missing bash shebang"
+              exit 1
+            fi
+            echo "✓ $script has bash shebang"
+          done
+
+  # Test Nix evaluation
+  test-nix-evaluation:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v20
+
+      - name: Test imageName extraction
+        run: |
+          IMAGE_NAME=$(nix eval --raw .#containerImage.imageName)
+          echo "Extracted imageName: $IMAGE_NAME"
+
+          if [ "$IMAGE_NAME" != "ghcr.io/buurro/publish-container-image" ]; then
+            echo "Error: Expected 'ghcr.io/buurro/publish-container-image', got '$IMAGE_NAME'"
+            exit 1
+          fi
+          echo "✓ imageName extraction successful"
+
+      - name: Test imageTag extraction
+        run: |
+          IMAGE_TAG=$(nix eval --raw .#containerImage.imageTag)
+          echo "Extracted imageTag: $IMAGE_TAG"
+
+          if [ "$IMAGE_TAG" != "0.2.0" ]; then
+            echo "Error: Expected '0.2.0', got '$IMAGE_TAG'"
+            exit 1
+          fi
+          echo "✓ imageTag extraction successful"
+
+      - name: Verify flake outputs
+        run: |
+          nix flake show
+          nix flake check
