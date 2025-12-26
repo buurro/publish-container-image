@@ -121,6 +121,7 @@ jobs:
       packages: write
     with:
       registry: ghcr.io
+      image-name: buurro/test-amd64-only
       architectures: amd64
       tag-latest: false
       nix-flake-attr: '.#containerImage'
@@ -158,6 +159,7 @@ jobs:
       packages: write
     with:
       registry: ghcr.io
+      image-name: buurro/test-multi-arch
       architectures: amd64 arm64
       tag-latest: false
       nix-flake-attr: '.#containerImage'
